@@ -1,11 +1,17 @@
 import streamlit as st
-import joblib
 import pandas as pd
 import base64
 import os
+import random
+import time
+
+# ===== CORE IMPORTS =====
+from core.battery_state import BatteryState
+from core.predictor import predict_capacity, predict_fire_risk
+from core.logger import log_event
 
 # ================= CONFIG =================
-MAX_CAPACITY = 2.0  # Maximum rated capacity = 100% health
+MAX_CAPACITY = 2.0
 
 st.set_page_config(
     page_title="EV Battery Monitoring System",
@@ -15,95 +21,106 @@ st.set_page_config(
 st.title("🔋 EV Battery Degradation & Fire Risk Monitoring System")
 st.markdown("### Software-Based IoT & Machine Learning Dashboard")
 
-degradation_model = joblib.load("models/degradation_model.pkl")
-fire_risk_model = joblib.load("models/fire_risk_model.pkl")
+# ================= SESSION STATE =================
+if "prev_risk" not in st.session_state:
+    st.session_state.prev_risk = 0
 
+# ================= BUZZER =================
 def play_buzzer():
-    alarm_file = os.path.join(os.getcwd(), "assets", "alarm.wav")
-    
-    if os.path.exists(alarm_file):
-        with open(alarm_file, "rb") as f:
-            audio_data = f.read()
-        audio_base64 = base64.b64encode(audio_data).decode()
-        st.components.v1.html(
-            f"""
-            <script>
-            let alarmTriggered = false;
-            
-            function playAlarm() {{
-                if (alarmTriggered) return;
-                alarmTriggered = true;
-                
-                const audio = new Audio('data:audio/wav;base64,{audio_base64}');
-                audio.volume = 0.8;
-                audio.loop = false;
-                
-                audio.play().then(function() {{
-                    console.log('Audio started successfully');
-                }}).catch(function(error) {{
-                    console.log('Immediate audio play failed:', error);
-                    const playOnClick = function() {{
-                        audio.play().then(function() {{
-                            console.log('Audio started after user interaction');
-                        }}).catch(function(err) {{
-                            console.log('Audio play failed completely:', err);
-                        }});
-                        document.removeEventListener('click', playOnClick);
-                        document.removeEventListener('keydown', playOnClick);
-                    }};
-                    
-                    document.addEventListener('click', playOnClick);
-                    document.addEventListener('keydown', playOnClick);
-                    
-                    const alertDiv = document.createElement('div');
-                    alertDiv.innerHTML = '🚨 ALARM! Click anywhere to play sound 🚨';
-                    alertDiv.style.cssText = 'position:fixed;top:10px;left:50%;transform:translateX(-50%);background:red;color:white;padding:10px;border-radius:5px;z-index:9999;font-weight:bold;';
-                    document.body.appendChild(alertDiv);
-                    
-                    setTimeout(() => {{
-                        if (document.body.contains(alertDiv)) {{
-                            document.body.removeChild(alertDiv);
-                        }}
-                    }}, 5000);
-                }});
-            }}
-            
-            playAlarm();
-            </script>
-            <div style="display:none; color:red; font-weight:bold;">🚨 AUDIO ALARM SYSTEM ACTIVE 🚨</div>
-            """,
-            height=0,
-        )
-        
-        st.error("🚨 ALARM ACTIVATED! 🚨")
-        
-    else:
-        st.error("🚨 ALARM! (Audio file not found) 🚨")
-        st.warning("⚠️ Audio file 'assets/alarm.wav' not found!")
+    alarm_file = os.path.join("assets", "alarm.wav")
 
+    if not os.path.exists(alarm_file):
+        st.error("⚠️ alarm.wav not found")
+        return
+
+    with open(alarm_file, "rb") as f:
+        audio_base64 = base64.b64encode(f.read()).decode()
+
+    st.components.v1.html(
+        f"""
+        <script>
+            const audio = new Audio("data:audio/wav;base64,{audio_base64}");
+            audio.volume = 0.9;
+            audio.play().catch(() => {{
+                document.addEventListener("click", () => audio.play(), {{ once: true }});
+            }});
+        </script>
+        """,
+        height=0,
+    )
+
+# ================= SIDEBAR =================
 st.sidebar.header("📡 Battery Sensor Inputs")
 
-temperature = st.sidebar.slider("Ambient Temperature (°C)", 0, 60, 30)
-voltage = st.sidebar.slider("Voltage (V)", 3.0, 4.2, 3.7)
-current = st.sidebar.slider("Current (A)", 0.5, 3.0, 1.5)
+mode = st.sidebar.radio("Mode Selection", ["Auto (Real-Time)", "Manual"])
 
-predicted_capacity = float(degradation_model.predict([[temperature]])[0])
-fire_risk = int(fire_risk_model.predict([[temperature, predicted_capacity]])[0])
+# ================= AUTO MODE =================
+if mode == "Auto (Real-Time)":
 
-# ================= BATTERY HEALTH (0–100%) =================
-battery_health = (predicted_capacity / MAX_CAPACITY) * 100
+    if "temp_sim" not in st.session_state:
+        st.session_state.temp_sim = 30
+        st.session_state.volt_sim = 3.9
+        st.session_state.curr_sim = 1.2
+
+    # Smooth realistic behavior
+    st.session_state.temp_sim += random.uniform(-0.2, 0.2)
+    st.session_state.curr_sim += random.uniform(-0.05, 0.05)
+
+    if random.random() < 0.1:
+        st.session_state.temp_sim += random.uniform(0.3, 0.7)
+
+    st.session_state.volt_sim -= random.uniform(0.0005, 0.002)
+
+    # Clamp
+    st.session_state.temp_sim = max(25, min(60, st.session_state.temp_sim))
+    st.session_state.volt_sim = max(3.2, min(4.2, st.session_state.volt_sim))
+    st.session_state.curr_sim = max(0.5, min(2.5, st.session_state.curr_sim))
+
+    temperature = st.session_state.temp_sim
+    voltage = st.session_state.volt_sim
+    current = st.session_state.curr_sim
+
+# ================= MANUAL MODE =================
+else:
+    temperature = st.sidebar.slider("Temperature (°C)", 0, 60, 30)
+    voltage = st.sidebar.slider("Voltage (V)", 3.0, 4.2, 3.7)
+    current = st.sidebar.slider("Current (A)", 0.5, 3.0, 1.5)
+
+# ================= ML =================
+predicted_capacity = predict_capacity(temperature)
+
+battery_state = BatteryState(
+    temperature=temperature,
+    voltage=voltage,
+    current=current,
+    capacity=predicted_capacity
+)
+
+fire_risk = predict_fire_risk(
+    battery_state.temperature,
+    battery_state.capacity
+)
+
+# ================= HEALTH =================
+battery_health = (battery_state.capacity / MAX_CAPACITY) * 100
 battery_health = max(0, min(battery_health, 100))
 
+# ================= DISPLAY =================
 st.subheader("📊 Battery Status")
 
 col1, col2, col3 = st.columns(3)
-col1.metric("🌡 Temperature (°C)", temperature)
-col2.metric("⚡ Voltage (V)", f"{voltage:.2f}")
-col3.metric("🔌 Current (A)", f"{current:.2f}")
+col1.metric("🌡 Temperature (°C)", f"{battery_state.temperature:.2f}")
+col2.metric("⚡ Voltage (V)", f"{battery_state.voltage:.2f}")
+col3.metric("🔌 Current (A)", f"{battery_state.current:.2f}")
 
-st.metric("🔋 Predicted Capacity", f"{predicted_capacity:.2f}")
-st.metric("📈 Battery Health (%)", f"{battery_health:.1f}")
+st.metric("🔋 Predicted Capacity", f"{battery_state.capacity:.2f}")
+st.metric("📈 Battery Health (SOH)", f"{battery_health:.1f}%")
 
+col4, col5 = st.columns(2)
+col4.metric("🔋 SOC", f"{battery_state.soc():.1f}%")
+col5.metric("⚡ Power", f"{battery_state.power():.2f} W")
+
+# ================= FIRE RISK =================
 st.subheader("🔥 Fire Risk Status")
 
 alarm = False
@@ -111,31 +128,43 @@ alarm = False
 if fire_risk == 0:
     st.success("🟢 SAFE")
 elif fire_risk == 1:
-    st.warning("🟡 WARNING – Limit Exceeded")
+    st.warning("🟡 WARNING")
     alarm = True
 else:
-    st.error("🔴 CRITICAL – Limit Exceeded")
+    st.error("🔴 CRITICAL")
     alarm = True
 
+# ================= LOG =================
+if fire_risk > st.session_state.prev_risk:
+    log_event(battery_state, fire_risk)
+
+st.session_state.prev_risk = fire_risk
+
+# ================= BUZZER =================
 if alarm:
-    st.warning("🔔 Alarm Triggered!")
+    st.warning("🔔 Buzzer Activated")
     play_buzzer()
 
+# ================= HISTORY =================
 st.subheader("📜 Recent Readings")
 
 if "history" not in st.session_state:
     st.session_state.history = []
 
 st.session_state.history.append({
-    "Temperature": temperature,
-    "Voltage": voltage,
-    "Current": current,
-    "Capacity": round(predicted_capacity, 2),
-    "Health (%)": round(battery_health, 1),
+    "Temp": round(battery_state.temperature, 2),
+    "Volt": round(battery_state.voltage, 2),
+    "Curr": round(battery_state.current, 2),
     "Risk": ["Safe", "Warning", "Critical"][fire_risk]
 })
 
 st.dataframe(pd.DataFrame(st.session_state.history[-5:]))
 
+# ================= FOOTER =================
 st.markdown("---")
-st.caption("🔄 Real-time monitoring (software-based IoT)")
+st.caption("🔄 Conference-aligned Battery Monitoring System")
+
+# ================= AUTO REFRESH =================
+if mode == "Auto (Real-Time)":
+    time.sleep(2)
+    st.rerun()
